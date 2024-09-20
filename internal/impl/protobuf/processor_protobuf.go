@@ -19,10 +19,16 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 
+	"buf.build/gen/go/bufbuild/reflect/connectrpc/go/buf/reflect/v1beta1/reflectv1beta1connect"
+	reflectv1beta1 "buf.build/gen/go/bufbuild/reflect/protocolbuffers/go/buf/reflect/v1beta1"
+	"github.com/bufbuild/prototransform"
 	"github.com/redpanda-data/benthos/v4/public/service"
+
+	connectrpc "connectrpc.com/connect"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -37,6 +43,13 @@ const (
 	fieldImportPaths    = "import_paths"
 	fieldDiscardUnknown = "discard_unknown"
 	fieldUseProtoNames  = "use_proto_names"
+
+	// BSR Config
+	fieldBSRConfig              = "bsr_config"
+	fieldReflectionServerURL    = "url"
+	fieldReflectionServerAPIKey = "api_key"
+	fieldModule                 = "module"
+	fieldVersion                = "version"
 )
 
 func protobufProcessorSpec() *service.ConfigSpec {
@@ -71,8 +84,22 @@ Attempts to create a target protobuf message from a generic JSON structure.
 			Description("If `true`, the `to_json` operator deserializes fields exactly as named in schema file.").
 			Default(false),
 		service.NewStringListField(fieldImportPaths).
-			Description("A list of directories containing .proto files, including all definitions required for parsing the target message. If left empty the current directory is used. Each directory listed will be walked with all found .proto files imported.").
+			Description("A list of directories containing .proto files, including all definitions required for parsing the target message. If left empty the current directory is used. Each directory listed will be walked with all found .proto files imported. Field ignored if using Buf Schema Registry Reflection API").
 			Default([]string{}),
+		service.NewObjectField(fieldBSRConfig,
+			service.NewStringField(fieldReflectionServerURL).
+				Description("Reflection server URL").
+				Default("https://buf.build").Advanced(),
+			service.NewStringField(fieldReflectionServerAPIKey).
+				Description("Reflection server API key").
+				Default(""), // todo: check if "default" is required here
+			service.NewStringField(fieldModule).
+				Description("Module").
+				Default(""), // todo: check here too and provide better description
+			service.NewStringField(fieldVersion).
+				Description("Version. Leave blank for latest").
+				Default("").Advanced(),
+		).Description("Optional Buf Schema Registry Reflection API config"),
 	).Example(
 		"JSON to Protobuf", `
 If we have the following protobuf definition within a directory called `+"`testing/schema`"+`:
@@ -211,6 +238,51 @@ func newProtobufToJSONOperator(f fs.FS, msg string, importPaths []string, usePro
 	}, nil
 }
 
+func newProtobufToJSONBSROperator(c *bsrConfig, msg string, useProtoNames bool) (protobufOperator, error) {
+	if msg == "" {
+		return nil, errors.New("message field must not be empty")
+	}
+
+	descriptors, types, err := loadDescriptorsFromBSR(c)
+	if err != nil {
+		return nil, err // todo
+	}
+
+	d, err := descriptors.FindDescriptorByName(protoreflect.FullName(msg))
+	if err != nil {
+		return nil, fmt.Errorf("unable to find message '%v' definition", msg)
+	}
+
+	md, ok := d.(protoreflect.MessageDescriptor)
+	if !ok {
+		return nil, fmt.Errorf("message descriptor %v was unexpected type %T", msg, d)
+	}
+
+	return func(part *service.Message) error {
+		partBytes, err := part.AsBytes()
+		if err != nil {
+			return err
+		}
+
+		dynMsg := dynamicpb.NewMessage(md)
+		if err := proto.Unmarshal(partBytes, dynMsg); err != nil {
+			return fmt.Errorf("failed to unmarshal protobuf message '%v': %w", msg, err)
+		}
+
+		opts := protojson.MarshalOptions{
+			Resolver:      types,
+			UseProtoNames: useProtoNames,
+		}
+		data, err := opts.Marshal(dynMsg)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal JSON protobuf message '%v': %w", msg, err)
+		}
+
+		part.SetBytes(data)
+		return nil
+	}, nil
+}
+
 func newProtobufFromJSONOperator(f fs.FS, msg string, importPaths []string, discardUnknown bool) (protobufOperator, error) {
 	if msg == "" {
 		return nil, errors.New("message field must not be empty")
@@ -256,12 +328,67 @@ func newProtobufFromJSONOperator(f fs.FS, msg string, importPaths []string, disc
 	}, nil
 }
 
+func newProtobufFromJSONBSROperator(c *bsrConfig, msg string, discardUnknown bool) (protobufOperator, error) {
+	if msg == "" {
+		return nil, errors.New("message field must not be empty")
+	}
+
+	_, types, err := loadDescriptorsFromBSR(c)
+	if err != nil {
+		return nil, err // todo: error wrapping
+	}
+
+	types.RangeMessages(func(mt protoreflect.MessageType) bool {
+		return true
+	})
+
+	md, err := types.FindMessageByName(protoreflect.FullName(msg))
+	if err != nil {
+		return nil, fmt.Errorf("unable to find message '%v' definition", msg)
+	}
+
+	return func(part *service.Message) error {
+		msgBytes, err := part.AsBytes()
+		if err != nil {
+			return err
+		}
+
+		dynMsg := dynamicpb.NewMessage(md.Descriptor())
+
+		opts := protojson.UnmarshalOptions{
+			Resolver:       types,
+			DiscardUnknown: discardUnknown,
+		}
+		if err := opts.Unmarshal(msgBytes, dynMsg); err != nil {
+			return fmt.Errorf("failed to unmarshal JSON message '%v': %w", msg, err)
+		}
+
+		data, err := proto.Marshal(dynMsg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal protobuf message '%v': %v", msg, err)
+		}
+
+		part.SetBytes(data)
+		return nil
+	}, nil
+}
+
 func strToProtobufOperator(f fs.FS, opStr, message string, importPaths []string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
 	switch opStr {
 	case "to_json":
 		return newProtobufToJSONOperator(f, message, importPaths, useProtoNames)
 	case "from_json":
 		return newProtobufFromJSONOperator(f, message, importPaths, discardUnknown)
+	}
+	return nil, fmt.Errorf("operator not recognised: %v", opStr)
+}
+
+func strToProtobufBSROperator(c *bsrConfig, opStr, message string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
+	switch opStr {
+	case "to_json":
+		return newProtobufToJSONBSROperator(c, message, useProtoNames)
+	case "from_json":
+		return newProtobufFromJSONBSROperator(c, message, discardUnknown)
 	}
 	return nil, fmt.Errorf("operator not recognised: %v", opStr)
 }
@@ -292,6 +419,30 @@ func loadDescriptors(f fs.FS, importPaths []string) (*protoregistry.Files, *prot
 	return RegistriesFromMap(files)
 }
 
+type bsrConfig struct {
+	reflectionServerURL, reflectionServerAPIKey, module, version string
+}
+
+func loadDescriptorsFromBSR(c *bsrConfig) (*protoregistry.Files, *protoregistry.Types, error) {
+	client := reflectv1beta1connect.NewFileDescriptorSetServiceClient(
+		http.DefaultClient, c.reflectionServerURL,
+		connectrpc.WithInterceptors(prototransform.NewAuthInterceptor(c.reflectionServerAPIKey)),
+		connectrpc.WithHTTPGet(),
+		connectrpc.WithHTTPGetMaxURLSize(8192, true),
+	)
+
+	req := connectrpc.NewRequest(&reflectv1beta1.GetFileDescriptorSetRequest{
+		Module:  c.module,
+		Version: c.version,
+	})
+
+	res, err := client.GetFileDescriptorSet(context.Background(), req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot retrieve file descriptor set %v", err.Error())
+	}
+	return RegistriesFromFileDescriptorSet(res.Msg.GetFileDescriptorSet())
+}
+
 //------------------------------------------------------------------------------
 
 type protobufProc struct {
@@ -314,11 +465,6 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 		return nil, err
 	}
 
-	var importPaths []string
-	if importPaths, err = conf.FieldStringList(fieldImportPaths); err != nil {
-		return nil, err
-	}
-
 	var discardUnknown bool
 	if discardUnknown, err = conf.FieldBool(fieldDiscardUnknown); err != nil {
 		return nil, err
@@ -329,8 +475,29 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 		return nil, err
 	}
 
-	if p.operator, err = strToProtobufOperator(mgr.FS(), operatorStr, message, importPaths, discardUnknown, useProtoNames); err != nil {
-		return nil, err
+	if conf.Contains(fieldBSRConfig) {
+		var bsrConfigMap map[string]string
+		if bsrConfigMap, err = conf.FieldStringMap(fieldBSRConfig); err != nil {
+			return nil, err
+		}
+		bsrConfig := &bsrConfig{
+			reflectionServerURL:    bsrConfigMap[fieldReflectionServerURL],
+			reflectionServerAPIKey: bsrConfigMap[fieldReflectionServerAPIKey],
+			module:                 bsrConfigMap[fieldModule],
+			version:                bsrConfigMap[fieldVersion],
+		}
+		if p.operator, err = strToProtobufBSROperator(bsrConfig, operatorStr, message, discardUnknown, useProtoNames); err != nil {
+			return nil, err
+		}
+	} else {
+		var importPaths []string
+		if importPaths, err = conf.FieldStringList(fieldImportPaths); err != nil {
+			return nil, err
+		}
+
+		if p.operator, err = strToProtobufOperator(mgr.FS(), operatorStr, message, importPaths, discardUnknown, useProtoNames); err != nil {
+			return nil, err
+		}
 	}
 	return p, nil
 }

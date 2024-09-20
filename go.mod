@@ -133,6 +133,13 @@ require (
 )
 
 require (
+	buf.build/gen/go/bufbuild/reflect/connectrpc/go v1.11.1-20230822193137-310c9c4845dd.1 // indirect
+	buf.build/gen/go/bufbuild/reflect/protocolbuffers/go v1.31.0-20230822193137-310c9c4845dd.1 // indirect
+	connectrpc.com/connect v1.11.1 // indirect
+	github.com/bufbuild/prototransform v0.4.0 // indirect
+)
+
+require (
 	cloud.google.com/go v0.112.2 // indirect
 	cloud.google.com/go/auth v0.2.2 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.1 // indirect

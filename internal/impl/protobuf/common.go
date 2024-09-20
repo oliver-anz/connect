@@ -15,10 +15,14 @@
 package protobuf
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/jhump/protoreflect/desc/protoparse"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
@@ -57,4 +61,58 @@ func RegistriesFromMap(filesMap map[string]string) (*protoregistry.Files, *proto
 		}
 	}
 	return files, types, nil
+}
+
+func RegistriesFromFileDescriptorSet(fd *descriptorpb.FileDescriptorSet) (*protoregistry.Files, *protoregistry.Types, error) {
+	if len(fd.GetFile()) == 0 {
+		return nil, nil, errors.New("") // todo
+	}
+
+	files, err := protodesc.FileOptions{AllowUnresolvable: true}.NewFiles(fd)
+	if err != nil {
+		return nil, nil, err // todo
+	}
+
+	types := &protoregistry.Types{}
+	var rangeErr error
+	files.RangeFiles(func(fileDescriptor protoreflect.FileDescriptor) bool {
+		if err := registerTypes(types, fileDescriptor); err != nil {
+			rangeErr = err
+			return false
+		}
+		return true
+	})
+	if rangeErr != nil {
+		return nil, nil, rangeErr // todo
+	}
+	return files, types, nil
+}
+
+type typeContainer interface {
+	Enums() protoreflect.EnumDescriptors
+	Messages() protoreflect.MessageDescriptors
+	Extensions() protoreflect.ExtensionDescriptors
+}
+
+func registerTypes(types *protoregistry.Types, container typeContainer) error {
+	for i := 0; i < container.Enums().Len(); i++ {
+		if err := types.RegisterEnum(dynamicpb.NewEnumType(container.Enums().Get(i))); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < container.Messages().Len(); i++ {
+		msg := container.Messages().Get(i)
+		if err := types.RegisterMessage(dynamicpb.NewMessageType(msg)); err != nil {
+			return err
+		}
+		if err := registerTypes(types, msg); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < container.Extensions().Len(); i++ {
+		if err := types.RegisterExtension(dynamicpb.NewExtensionType(container.Extensions().Get(i))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
