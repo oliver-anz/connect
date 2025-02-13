@@ -484,7 +484,7 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 		return nil, err
 	}
 	// if BSR config is present, use BSR to discover proto definitions
-	if len(bsrConfigMap) > 0 {
+	if bsrConfigMap[fieldModule] != "" {
 		bsrConfig := &bsrConfig{
 			reflectionServerURL:    bsrConfigMap[fieldReflectionServerURL],
 			reflectionServerAPIKey: bsrConfigMap[fieldReflectionServerAPIKey],
