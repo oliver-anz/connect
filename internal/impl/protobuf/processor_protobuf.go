@@ -92,13 +92,14 @@ Attempts to create a target protobuf message from a generic JSON structure.
 				Default("https://buf.build").Advanced(),
 			service.NewStringField(fieldReflectionServerAPIKey).
 				Description("Reflection server API key").
-				Default(""), // todo: check if "default" is required here
+				Secret().
+				Default(""),
 			service.NewStringField(fieldModule).
 				Description("Module").
-				Default(""), // todo: check here too and provide better description
+				Default(""),
 			service.NewStringField(fieldVersion).
-				Description("Version. Leave blank for latest").
-				Default("").Advanced(),
+				Description("Version to retrieve from the Buf Schema Registry, leave blank for latest.").
+				Optional().Advanced(),
 		).Description("Optional Buf Schema Registry Reflection API config"),
 	).Example(
 		"JSON to Protobuf", `
@@ -438,12 +439,15 @@ func loadDescriptorsFromBSR(c *bsrConfig) (*protoregistry.Files, *protoregistry.
 
 	res, err := client.GetFileDescriptorSet(context.Background(), req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cannot retrieve file descriptor set %v", err.Error())
+		return nil, nil, fmt.Errorf("could not retrieve file descriptor set %v", err.Error())
+	}
+	if len(res.Msg.GetFileDescriptorSet().GetFile()) == 0 {
+		return nil, nil, fmt.Errorf("empty file descriptor set for module and version")
 	}
 	return RegistriesFromFileDescriptorSet(res.Msg.GetFileDescriptorSet())
 }
 
-//------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 
 type protobufProc struct {
 	operator protobufOperator
@@ -475,11 +479,12 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 		return nil, err
 	}
 
-	if conf.Contains(fieldBSRConfig) {
-		var bsrConfigMap map[string]string
-		if bsrConfigMap, err = conf.FieldStringMap(fieldBSRConfig); err != nil {
-			return nil, err
-		}
+	var bsrConfigMap map[string]string
+	if bsrConfigMap, err = conf.FieldStringMap(fieldBSRConfig); err != nil {
+		return nil, err
+	}
+	// if BSR config is present, use BSR to discover proto definitions
+	if bsrConfigMap != nil {
 		bsrConfig := &bsrConfig{
 			reflectionServerURL:    bsrConfigMap[fieldReflectionServerURL],
 			reflectionServerAPIKey: bsrConfigMap[fieldReflectionServerAPIKey],
@@ -490,6 +495,7 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 			return nil, err
 		}
 	} else {
+		// else read from file paths
 		var importPaths []string
 		if importPaths, err = conf.FieldStringList(fieldImportPaths); err != nil {
 			return nil, err

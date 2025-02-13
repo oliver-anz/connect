@@ -15,7 +15,6 @@
 package protobuf
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/jhump/protoreflect/desc/protoparse"
@@ -64,26 +63,24 @@ func RegistriesFromMap(filesMap map[string]string) (*protoregistry.Files, *proto
 }
 
 func RegistriesFromFileDescriptorSet(fd *descriptorpb.FileDescriptorSet) (*protoregistry.Files, *protoregistry.Types, error) {
-	if len(fd.GetFile()) == 0 {
-		return nil, nil, errors.New("") // todo
-	}
-
 	files, err := protodesc.FileOptions{AllowUnresolvable: true}.NewFiles(fd)
 	if err != nil {
-		return nil, nil, err // todo
+		return nil, nil, fmt.Errorf("failed to parse file descriptor set: %w", err)
 	}
 
 	types := &protoregistry.Types{}
 	var rangeErr error
+	var failedFdName string
 	files.RangeFiles(func(fileDescriptor protoreflect.FileDescriptor) bool {
 		if err := registerTypes(types, fileDescriptor); err != nil {
 			rangeErr = err
+			failedFdName = string(fileDescriptor.FullName())
 			return false
 		}
 		return true
 	})
 	if rangeErr != nil {
-		return nil, nil, rangeErr // todo
+		return nil, nil, fmt.Errorf("failed to register file descriptor " + failedFdName)
 	}
 	return files, types, nil
 }
