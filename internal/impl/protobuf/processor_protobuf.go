@@ -45,7 +45,7 @@ const (
 	fieldUseProtoNames  = "use_proto_names"
 
 	// BSR Config
-	fieldBSRConfig              = "bsr_config"
+	fieldBSRConfig              = "bsr"
 	fieldReflectionServerURL    = "url"
 	fieldReflectionServerAPIKey = "api_key"
 	fieldModule                 = "module"
