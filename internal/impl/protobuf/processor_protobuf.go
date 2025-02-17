@@ -48,8 +48,8 @@ const (
 	fieldBSRConfig              = "bsr"
 	fieldReflectionServerURL    = "url"
 	fieldReflectionServerAPIKey = "api_key"
-	fieldModule                 = "module"
-	fieldVersion                = "version"
+	fieldModules                = "modules"
+	fieldVersions               = "versions"
 )
 
 func protobufProcessorSpec() *service.ConfigSpec {
@@ -94,10 +94,10 @@ Attempts to create a target protobuf message from a generic JSON structure.
 				Description("Reflection server API key").
 				Secret().
 				Default(""),
-			service.NewStringField(fieldModule).
-				Description("Module").
+			service.NewStringListField(fieldModules).
+				Description("").
 				Default(""),
-			service.NewStringField(fieldVersion).
+			service.NewStringListField(fieldVersions).
 				Description("Version to retrieve from the Buf Schema Registry, leave blank for latest.").
 				Optional().Advanced(),
 		).Description("Optional Buf Schema Registry Reflection API config"),
@@ -231,7 +231,7 @@ func newProtobufToJSONOperator(f fs.FS, msg string, importPaths []string, usePro
 		}
 		data, err := opts.Marshal(dynMsg)
 		if err != nil {
-			return fmt.Errorf("failed to unmarshal JSON protobuf message '%v': %w", msg, err)
+			return fmt.Errorf("failed to marshal JSON protobuf message '%v': %w", msg, err)
 		}
 
 		part.SetBytes(data)
@@ -239,44 +239,34 @@ func newProtobufToJSONOperator(f fs.FS, msg string, importPaths []string, usePro
 	}, nil
 }
 
-func newProtobufToJSONBSROperator(c *bsrConfig, msg string, useProtoNames bool) (protobufOperator, error) {
+func newProtobufToJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, msg string, useProtoNames bool) (protobufOperator, error) {
 	if msg == "" {
 		return nil, errors.New("message field must not be empty")
 	}
 
-	descriptors, types, err := loadDescriptorsFromBSR(c)
-	if err != nil {
-		return nil, err // todo
-	}
-
-	d, err := descriptors.FindDescriptorByName(protoreflect.FullName(msg))
-	if err != nil {
-		return nil, fmt.Errorf("unable to find message '%v' definition", msg)
-	}
-
-	md, ok := d.(protoreflect.MessageDescriptor)
-	if !ok {
-		return nil, fmt.Errorf("message descriptor %v was unexpected type %T", msg, d)
-	}
-
 	return func(part *service.Message) error {
+		d, err := multiModuleWatcher.FindMessageByName(protoreflect.FullName(msg))
+		if err != nil {
+			return fmt.Errorf("unable to find message '%v' definition: %w", msg, err)
+		}
+
 		partBytes, err := part.AsBytes()
 		if err != nil {
 			return err
 		}
 
-		dynMsg := dynamicpb.NewMessage(md)
+		dynMsg := dynamicpb.NewMessage(d.Descriptor())
 		if err := proto.Unmarshal(partBytes, dynMsg); err != nil {
 			return fmt.Errorf("failed to unmarshal protobuf message '%v': %w", msg, err)
 		}
 
 		opts := protojson.MarshalOptions{
-			Resolver:      types,
+			Resolver:      multiModuleWatcher,
 			UseProtoNames: useProtoNames,
 		}
 		data, err := opts.Marshal(dynMsg)
 		if err != nil {
-			return fmt.Errorf("failed to unmarshal JSON protobuf message '%v': %w", msg, err)
+			return fmt.Errorf("failed to marshal JSON protobuf message '%v': %w", msg, err)
 		}
 
 		part.SetBytes(data)
@@ -329,35 +319,26 @@ func newProtobufFromJSONOperator(f fs.FS, msg string, importPaths []string, disc
 	}, nil
 }
 
-func newProtobufFromJSONBSROperator(c *bsrConfig, msg string, discardUnknown bool) (protobufOperator, error) {
+func newProtobufFromJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, msg string, discardUnknown bool) (protobufOperator, error) {
 	if msg == "" {
 		return nil, errors.New("message field must not be empty")
 	}
 
-	_, types, err := loadDescriptorsFromBSR(c)
-	if err != nil {
-		return nil, err // todo: error wrapping
-	}
-
-	types.RangeMessages(func(mt protoreflect.MessageType) bool {
-		return true
-	})
-
-	md, err := types.FindMessageByName(protoreflect.FullName(msg))
-	if err != nil {
-		return nil, fmt.Errorf("unable to find message '%v' definition", msg)
-	}
-
 	return func(part *service.Message) error {
+		d, err := multiModuleWatcher.FindMessageByName(protoreflect.FullName(msg))
+		if err != nil {
+			return fmt.Errorf("unable to find message '%v' definition: %w", msg, err)
+		}
+
 		msgBytes, err := part.AsBytes()
 		if err != nil {
 			return err
 		}
 
-		dynMsg := dynamicpb.NewMessage(md.Descriptor())
+		dynMsg := dynamicpb.NewMessage(d.Descriptor())
 
 		opts := protojson.UnmarshalOptions{
-			Resolver:       types,
+			Resolver:       multiModuleWatcher,
 			DiscardUnknown: discardUnknown,
 		}
 		if err := opts.Unmarshal(msgBytes, dynMsg); err != nil {
@@ -384,12 +365,12 @@ func strToProtobufOperator(f fs.FS, opStr, message string, importPaths []string,
 	return nil, fmt.Errorf("operator not recognised: %v", opStr)
 }
 
-func strToProtobufBSROperator(c *bsrConfig, opStr, message string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
+func strToProtobufBSROperator(multiModuleWatcher *MultiModuleWatcher, opStr, message string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
 	switch opStr {
 	case "to_json":
-		return newProtobufToJSONBSROperator(c, message, useProtoNames)
+		return newProtobufToJSONBSROperator(multiModuleWatcher, message, useProtoNames)
 	case "from_json":
-		return newProtobufFromJSONBSROperator(c, message, discardUnknown)
+		return newProtobufFromJSONBSROperator(multiModuleWatcher, message, discardUnknown)
 	}
 	return nil, fmt.Errorf("operator not recognised: %v", opStr)
 }
@@ -452,6 +433,8 @@ func loadDescriptorsFromBSR(c *bsrConfig) (*protoregistry.Files, *protoregistry.
 type protobufProc struct {
 	operator protobufOperator
 	log      *service.Logger
+	// Used for loading schemas from buf schema registries
+	multiModuleWatcher *MultiModuleWatcher
 }
 
 func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufProc, error) {
@@ -479,19 +462,38 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 		return nil, err
 	}
 
-	var bsrConfigMap map[string]string
-	if bsrConfigMap, err = conf.FieldStringMap(fieldBSRConfig); err != nil {
+	// Load BSR config
+	var bsrConfigMap map[string]*service.ParsedConfig
+	if bsrConfigMap, err = conf.FieldObjectMap(fieldBSRConfig); err != nil {
 		return nil, err
 	}
+
+	var bsrApiKey string
+	if bsrApiKey, err = bsrConfigMap[fieldReflectionServerAPIKey].FieldString(); err != nil {
+		return nil, err
+	}
+
+	var modules []string
+	if modules, err = bsrConfigMap[fieldModules].FieldStringList(); err != nil {
+		return nil, err
+	}
+
+	var versions []string
+	if versions, err = bsrConfigMap[fieldVersions].FieldStringList(); err != nil {
+		return nil, err
+	}
+
 	// if BSR config is present, use BSR to discover proto definitions
-	if bsrConfigMap[fieldModule] != "" {
-		bsrConfig := &bsrConfig{
-			reflectionServerURL:    bsrConfigMap[fieldReflectionServerURL],
-			reflectionServerAPIKey: bsrConfigMap[fieldReflectionServerAPIKey],
-			module:                 bsrConfigMap[fieldModule],
-			version:                bsrConfigMap[fieldVersion],
+	if len(modules) > 0 {
+		p.multiModuleWatcher, err = newMultiModuleWatcher("",
+			bsrApiKey,
+			modules,
+			versions)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create MultiModuleWatcher: %w", err)
 		}
-		if p.operator, err = strToProtobufBSROperator(bsrConfig, operatorStr, message, discardUnknown, useProtoNames); err != nil {
+
+		if p.operator, err = strToProtobufBSROperator(p.multiModuleWatcher, operatorStr, message, discardUnknown, useProtoNames); err != nil {
 			return nil, err
 		}
 	} else {
