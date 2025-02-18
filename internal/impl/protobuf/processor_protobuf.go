@@ -45,11 +45,11 @@ const (
 	fieldUseProtoNames  = "use_proto_names"
 
 	// BSR Config
-	fieldBSRConfig              = "bsr"
-	fieldReflectionServerURL    = "url"
-	fieldReflectionServerAPIKey = "api_key"
-	fieldModules                = "modules"
-	fieldVersions               = "versions"
+	fieldBSRConfig = "bsr"
+	fieldBsrUrl    = "url"
+	fieldBsrApiKey = "api_key"
+	fieldModule    = "module"
+	fieldVersion   = "version"
 )
 
 func protobufProcessorSpec() *service.ConfigSpec {
@@ -86,20 +86,20 @@ Attempts to create a target protobuf message from a generic JSON structure.
 		service.NewStringListField(fieldImportPaths).
 			Description("A list of directories containing .proto files, including all definitions required for parsing the target message. If left empty the current directory is used. Each directory listed will be walked with all found .proto files imported. Field ignored if using Buf Schema Registry Reflection API").
 			Default([]string{}),
-		service.NewObjectField(fieldBSRConfig,
-			service.NewStringField(fieldReflectionServerURL).
-				Description("Reflection server URL").
-				Default("https://buf.build").Advanced(),
-			service.NewStringField(fieldReflectionServerAPIKey).
-				Description("Reflection server API key").
+		service.NewObjectListField(fieldBSRConfig,
+			service.NewStringField(fieldBsrUrl).
+				Description("Buf Schema Registry URL, leave blank to extract from module.").
+				Default("").Advanced(),
+			service.NewStringField(fieldBsrApiKey).
+				Description("Buf Schema Registry API server API key, can be left blank for a public registry.").
 				Secret().
 				Default(""),
-			service.NewStringListField(fieldModules).
-				Description("").
+			service.NewStringField(fieldModule).
+				Description("Module to fetch from Buf Schema Registry e.g. 'buf.build/exampleco/payments'.").
 				Default(""),
-			service.NewStringListField(fieldVersions).
+			service.NewStringField(fieldVersion).
 				Description("Version to retrieve from the Buf Schema Registry, leave blank for latest.").
-				Optional().Advanced(),
+				Default("").Advanced(),
 		).Description("Optional Buf Schema Registry Reflection API config"),
 	).Example(
 		"JSON to Protobuf", `
@@ -463,32 +463,14 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 	}
 
 	// Load BSR config
-	var bsrConfigMap map[string]*service.ParsedConfig
-	if bsrConfigMap, err = conf.FieldObjectMap(fieldBSRConfig); err != nil {
-		return nil, err
-	}
-
-	var bsrApiKey string
-	if bsrApiKey, err = bsrConfigMap[fieldReflectionServerAPIKey].FieldString(); err != nil {
-		return nil, err
-	}
-
-	var modules []string
-	if modules, err = bsrConfigMap[fieldModules].FieldStringList(); err != nil {
-		return nil, err
-	}
-
-	var versions []string
-	if versions, err = bsrConfigMap[fieldVersions].FieldStringList(); err != nil {
+	var bsrModules []*service.ParsedConfig
+	if bsrModules, err = conf.FieldObjectList(fieldBSRConfig); err != nil {
 		return nil, err
 	}
 
 	// if BSR config is present, use BSR to discover proto definitions
-	if len(modules) > 0 {
-		p.multiModuleWatcher, err = newMultiModuleWatcher("",
-			bsrApiKey,
-			modules,
-			versions)
+	if len(bsrModules) > 0 {
+		p.multiModuleWatcher, err = newMultiModuleWatcher(bsrModules)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create MultiModuleWatcher: %w", err)
 		}

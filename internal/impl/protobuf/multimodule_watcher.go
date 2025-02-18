@@ -11,6 +11,7 @@ import (
 	"buf.build/gen/go/bufbuild/reflect/connectrpc/go/buf/reflect/v1beta1/reflectv1beta1connect"
 	connectrpc "connectrpc.com/connect"
 	"github.com/bufbuild/prototransform"
+	"github.com/redpanda-data/benthos/v4/public/service"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 )
@@ -21,38 +22,64 @@ type MultiModuleWatcher struct {
 
 var _ prototransform.Resolver = &MultiModuleWatcher{}
 
-func newMultiModuleWatcher(bsrUrl string, bsrApiKey string, modules []string, versions []string) (*MultiModuleWatcher, error) {
-	if len(modules) != len(versions) {
-		return nil, fmt.Errorf("could not create MultiModuleWatcher as modules and versions were not the same length")
+func newMultiModuleWatcher(bsrModules []*service.ParsedConfig) (*MultiModuleWatcher, error) {
+	if len(bsrModules) == 0 {
+		return nil, errors.New("no modules provided")
 	}
-
 	multiModuleWatcher := &MultiModuleWatcher{}
 
 	// Initialise one client for each module
 	multiModuleWatcher.bsrClients = make(map[string]*prototransform.SchemaWatcher)
-	for i, _ := range modules {
-		watcher, err := newSchemaWatcher(context.Background(), bsrUrl, bsrApiKey, modules[i], versions[i])
+	for _, bsrModule := range bsrModules {
+		var bsrUrl string
+		bsrUrl, err := bsrModule.FieldString(fieldBsrUrl)
 		if err != nil {
 			return nil, err
 		}
-		multiModuleWatcher.bsrClients[modules[i]] = watcher
+
+		var bsrApiKey string
+		if bsrApiKey, err = bsrModule.FieldString(fieldBsrApiKey); err != nil {
+			return nil, err
+		}
+
+		var module string
+		if module, err = bsrModule.FieldString(fieldModule); err != nil {
+			return nil, err
+		}
+
+		var version string
+		if version, err = bsrModule.FieldString(fieldVersion); err != nil {
+			return nil, err
+		}
+
+		watcher, err := newSchemaWatcher(context.Background(), bsrUrl, bsrApiKey, module, version)
+		if err != nil {
+			return nil, err
+		}
+		multiModuleWatcher.bsrClients[module] = watcher
 	}
 
 	return multiModuleWatcher, nil
 }
 
 func newSchemaWatcher(ctx context.Context, bsrUrl string, bsrApiKey string, module string, version string) (*prototransform.SchemaWatcher, error) {
-	segments := strings.Split(module, "/")
-	if len(segments) != 3 {
-		return nil, fmt.Errorf("could not parse module %s, expected three segments e.g. 'buf.build/exampleco/payments'", module)
+	// If no BSR url provided, extract from module
+	if bsrUrl == "" {
+		segments := strings.Split(module, "/")
+		if len(segments) != 3 {
+			return nil, fmt.Errorf("could not parse module %s, expected three segments e.g. 'buf.build/exampleco/payments'", module)
+		}
+		bsrUrl = "https://" + segments[0]
 	}
 
-	client := reflectv1beta1connect.NewFileDescriptorSetServiceClient(
-		http.DefaultClient, "https://"+segments[0],
-		connectrpc.WithInterceptors(prototransform.NewAuthInterceptor(bsrApiKey)),
+	opts := []connectrpc.ClientOption{
 		connectrpc.WithHTTPGet(),
-		connectrpc.WithHTTPGetMaxURLSize(8192, true),
-	)
+		connectrpc.WithHTTPGetMaxURLSize(8192, true)}
+
+	if bsrApiKey != "" {
+		opts = append(opts, connectrpc.WithInterceptors(prototransform.NewAuthInterceptor(bsrApiKey)))
+	}
+	client := reflectv1beta1connect.NewFileDescriptorSetServiceClient(http.DefaultClient, bsrUrl, opts...)
 
 	cfg := &prototransform.SchemaWatcherConfig{
 		SchemaPoller: prototransform.NewSchemaPoller(
@@ -60,6 +87,7 @@ func newSchemaWatcher(ctx context.Context, bsrUrl string, bsrApiKey string, modu
 			module,
 			version,
 		),
+		Jitter: 0.2,
 	}
 	watcher, err := prototransform.NewSchemaWatcher(ctx, cfg)
 	if err != nil {
