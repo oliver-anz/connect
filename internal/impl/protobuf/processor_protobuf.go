@@ -16,7 +16,6 @@ package protobuf
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -38,11 +37,12 @@ import (
 )
 
 const (
-	fieldOperator       = "operator"
-	fieldMessage        = "message"
-	fieldImportPaths    = "import_paths"
-	fieldDiscardUnknown = "discard_unknown"
-	fieldUseProtoNames  = "use_proto_names"
+	fieldOperator            = "operator"
+	fieldMessage             = "message"
+	fieldMessageFromMetadata = "message_from_metadata"
+	fieldImportPaths         = "import_paths"
+	fieldDiscardUnknown      = "discard_unknown"
+	fieldUseProtoNames       = "use_proto_names"
 
 	// BSR Config
 	fieldBSRConfig = "bsr"
@@ -76,7 +76,11 @@ Attempts to create a target protobuf message from a generic JSON structure.
 		service.NewStringEnumField(fieldOperator, "to_json", "from_json").
 			Description("The <<operators, operator>> to execute"),
 		service.NewStringField(fieldMessage).
-			Description("The fully qualified name of the protobuf message to convert to/from."),
+			Description("The fully qualified name of the protobuf message to convert to/from. Exclusive with message_from_metadata.").
+			Default(""),
+		service.NewStringField(fieldMessageFromMetadata).
+			Description("The metadata attribute from which to read the fully qualified name of the protobuf message to convert to/from. Exclusive with message.").
+			Default(""),
 		service.NewBoolField(fieldDiscardUnknown).
 			Description("If `true`, the `from_json` operator discards fields that are unknown to the schema.").
 			Default(false),
@@ -194,27 +198,28 @@ func init() {
 
 type protobufOperator func(part *service.Message) error
 
-func newProtobufToJSONOperator(f fs.FS, msg string, importPaths []string, useProtoNames bool) (protobufOperator, error) {
-	if msg == "" {
-		return nil, errors.New("message field must not be empty")
-	}
-
+func newProtobufToJSONOperator(f fs.FS, message, messageFromMetadata string, importPaths []string, useProtoNames bool) (protobufOperator, error) {
 	descriptors, types, err := loadDescriptors(f, importPaths)
 	if err != nil {
 		return nil, err
 	}
 
-	d, err := descriptors.FindDescriptorByName(protoreflect.FullName(msg))
-	if err != nil {
-		return nil, fmt.Errorf("unable to find message '%v' definition within '%v'", msg, importPaths)
-	}
-
-	md, ok := d.(protoreflect.MessageDescriptor)
-	if !ok {
-		return nil, fmt.Errorf("message descriptor %v was unexpected type %T", msg, d)
-	}
-
 	return func(part *service.Message) error {
+		msg, err := getMessage(part, message, messageFromMetadata)
+		if err != nil {
+			return err
+		}
+
+		d, err := descriptors.FindDescriptorByName(protoreflect.FullName(msg))
+		if err != nil {
+			return fmt.Errorf("unable to find message '%v' definition within '%v'", msg, importPaths)
+		}
+
+		md, ok := d.(protoreflect.MessageDescriptor)
+		if !ok {
+			return fmt.Errorf("message descriptor %v was unexpected type %T", msg, d)
+		}
+
 		partBytes, err := part.AsBytes()
 		if err != nil {
 			return err
@@ -239,12 +244,13 @@ func newProtobufToJSONOperator(f fs.FS, msg string, importPaths []string, usePro
 	}, nil
 }
 
-func newProtobufToJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, msg string, useProtoNames bool) (protobufOperator, error) {
-	if msg == "" {
-		return nil, errors.New("message field must not be empty")
-	}
-
+func newProtobufToJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, message, messageFromMetadata string, useProtoNames bool) (protobufOperator, error) {
 	return func(part *service.Message) error {
+		msg, err := getMessage(part, message, messageFromMetadata)
+		if err != nil {
+			return err
+		}
+
 		d, err := multiModuleWatcher.FindMessageByName(protoreflect.FullName(msg))
 		if err != nil {
 			return fmt.Errorf("unable to find message '%v' definition: %w", msg, err)
@@ -274,26 +280,27 @@ func newProtobufToJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, msg st
 	}, nil
 }
 
-func newProtobufFromJSONOperator(f fs.FS, msg string, importPaths []string, discardUnknown bool) (protobufOperator, error) {
-	if msg == "" {
-		return nil, errors.New("message field must not be empty")
-	}
-
+func newProtobufFromJSONOperator(f fs.FS, message, messageFromMetadata string, importPaths []string, discardUnknown bool) (protobufOperator, error) {
 	_, types, err := loadDescriptors(f, importPaths)
 	if err != nil {
 		return nil, err
 	}
 
-	types.RangeMessages(func(mt protoreflect.MessageType) bool {
-		return true
-	})
-
-	md, err := types.FindMessageByName(protoreflect.FullName(msg))
-	if err != nil {
-		return nil, fmt.Errorf("unable to find message '%v' definition within '%v'", msg, importPaths)
-	}
+	// types.RangeMessages(func(mt protoreflect.MessageType) bool {
+	// 	return true
+	// })
 
 	return func(part *service.Message) error {
+		msg, err := getMessage(part, message, messageFromMetadata)
+		if err != nil {
+			return err
+		}
+
+		md, err := types.FindMessageByName(protoreflect.FullName(msg))
+		if err != nil {
+			return fmt.Errorf("unable to find message '%v' definition within '%v'", msg, importPaths)
+		}
+
 		msgBytes, err := part.AsBytes()
 		if err != nil {
 			return err
@@ -319,12 +326,13 @@ func newProtobufFromJSONOperator(f fs.FS, msg string, importPaths []string, disc
 	}, nil
 }
 
-func newProtobufFromJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, msg string, discardUnknown bool) (protobufOperator, error) {
-	if msg == "" {
-		return nil, errors.New("message field must not be empty")
-	}
-
+func newProtobufFromJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, message, messageFromMetadata string, discardUnknown bool) (protobufOperator, error) {
 	return func(part *service.Message) error {
+		msg, err := getMessage(part, message, messageFromMetadata)
+		if err != nil {
+			return err
+		}
+		
 		d, err := multiModuleWatcher.FindMessageByName(protoreflect.FullName(msg))
 		if err != nil {
 			return fmt.Errorf("unable to find message '%v' definition: %w", msg, err)
@@ -355,24 +363,42 @@ func newProtobufFromJSONBSROperator(multiModuleWatcher *MultiModuleWatcher, msg 
 	}, nil
 }
 
-func strToProtobufOperator(f fs.FS, opStr, message string, importPaths []string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
+func strToProtobufOperator(f fs.FS, opStr, message, messageFromMetadata string, importPaths []string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
 	switch opStr {
 	case "to_json":
-		return newProtobufToJSONOperator(f, message, importPaths, useProtoNames)
+		return newProtobufToJSONOperator(f, message, messageFromMetadata, importPaths, useProtoNames)
 	case "from_json":
-		return newProtobufFromJSONOperator(f, message, importPaths, discardUnknown)
+		return newProtobufFromJSONOperator(f, message, messageFromMetadata, importPaths, discardUnknown)
 	}
 	return nil, fmt.Errorf("operator not recognised: %v", opStr)
 }
 
-func strToProtobufBSROperator(multiModuleWatcher *MultiModuleWatcher, opStr, message string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
+func strToProtobufBSROperator(multiModuleWatcher *MultiModuleWatcher, opStr, message, messageFromMetadata string, discardUnknown, useProtoNames bool) (protobufOperator, error) {
 	switch opStr {
 	case "to_json":
-		return newProtobufToJSONBSROperator(multiModuleWatcher, message, useProtoNames)
+		return newProtobufToJSONBSROperator(multiModuleWatcher, message, messageFromMetadata, useProtoNames)
 	case "from_json":
-		return newProtobufFromJSONBSROperator(multiModuleWatcher, message, discardUnknown)
+		return newProtobufFromJSONBSROperator(multiModuleWatcher, message, messageFromMetadata, discardUnknown)
 	}
 	return nil, fmt.Errorf("operator not recognised: %v", opStr)
+}
+
+func getMessage(part *service.Message, message, messageFromMetadata string) (string, error) {
+	// use static message name
+	if message != "" {
+		return message, nil
+	} else {
+		// else retrieve from metadata
+		value, present := part.MetaGetMut(messageFromMetadata)
+		if !present {
+			return "", fmt.Errorf("could not read value for messageFromMetadata key %s", messageFromMetadata)
+		}
+		msg, ok := value.(string)
+		if !ok {
+			return "", fmt.Errorf("value for messageFromMetadata key %s was not a string", messageFromMetadata)
+		}
+		return msg, nil
+	}
 }
 
 func loadDescriptors(f fs.FS, importPaths []string) (*protoregistry.Files, *protoregistry.Types, error) {
@@ -452,6 +478,19 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 		return nil, err
 	}
 
+	var messageFromMetadata string
+	if messageFromMetadata, err = conf.FieldString(fieldMessageFromMetadata); err != nil {
+		return nil, err
+	}
+
+	if messageFromMetadata == "" && message == "" {
+		return nil, fmt.Errorf("message and message_from_metadata can't both be empty")
+	}
+
+	if messageFromMetadata != "" && message != "" {
+		return nil, fmt.Errorf("message and message_from_metadata can't both be populated")
+	}
+
 	var discardUnknown bool
 	if discardUnknown, err = conf.FieldBool(fieldDiscardUnknown); err != nil {
 		return nil, err
@@ -475,7 +514,7 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 			return nil, fmt.Errorf("failed to create MultiModuleWatcher: %w", err)
 		}
 
-		if p.operator, err = strToProtobufBSROperator(p.multiModuleWatcher, operatorStr, message, discardUnknown, useProtoNames); err != nil {
+		if p.operator, err = strToProtobufBSROperator(p.multiModuleWatcher, operatorStr, message, messageFromMetadata, discardUnknown, useProtoNames); err != nil {
 			return nil, err
 		}
 	} else {
@@ -485,7 +524,7 @@ func newProtobuf(conf *service.ParsedConfig, mgr *service.Resources) (*protobufP
 			return nil, err
 		}
 
-		if p.operator, err = strToProtobufOperator(mgr.FS(), operatorStr, message, importPaths, discardUnknown, useProtoNames); err != nil {
+		if p.operator, err = strToProtobufOperator(mgr.FS(), operatorStr, message, messageFromMetadata, importPaths, discardUnknown, useProtoNames); err != nil {
 			return nil, err
 		}
 	}
